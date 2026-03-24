@@ -45,33 +45,31 @@ def safe_text(text):
     return text
 
 
-def calc_iso24817(pressure_mpa, od, wall, rem_wall, yield_strength, ec, defect_type, defect_loc, wall_loss_ratio):
+# ======================================================================
+# CALCULATION ENGINES
+# ======================================================================
+
+def calc_iso24817(pressure_mpa, od, wall, rem_wall, yield_strength, ec, repair_class):
     """
     ISO 24817 repair thickness calculation.
-    Uses the FIXED design strain εct = 0.008 (0.8%).
-    
-    Formula: t_repair = (1 / (Ec × εct)) × ((pf × D / 2) − Sa × ts)
-    
-    Where:
-      pf  = design pressure (MPa)
-      D   = pipe outer diameter (mm)
-      Sa  = pipe yield strength (MPa)
-      ts  = remaining wall thickness (mm)
-      Ec  = composite circumferential modulus (MPa)
-      εct = 0.008 (ISO 24817 code-mandated short-term strain limit)
+    Uses the FIXED design strain ect = 0.008 (0.8%).
+
+    repair_class: "Type A" or "Type B" - selected by the engineer directly.
+
+    Type A: t_repair = (1 / (Ec x ect)) x ((pf x D / 2) - Sa x ts)
+            Steel remaining wall contributes. Composite shares the load.
+
+    Type B: t_repair = (pf x D) / (2 x Ec x ect)
+            No steel credit. Composite carries full hoop stress alone.
     """
-    is_through_wall = defect_type in ["Leak", "Crack"]
-    is_severe = wall_loss_ratio > 0.80
-
-    # Steel contribution to hoop resistance
-    if is_through_wall or is_severe:
-        steel_contribution = 0.0  # No credit for remaining steel
-    else:
-        steel_contribution = yield_strength * rem_wall
-
-    # Composite must carry the deficit
     total_hoop_demand = (pressure_mpa * od) / 2.0
-    composite_demand = max(0.0, total_hoop_demand - steel_contribution)
+
+    if repair_class == "Type A":
+        steel_contribution = yield_strength * rem_wall
+        composite_demand = max(0.0, total_hoop_demand - steel_contribution)
+    else:  # Type B
+        steel_contribution = 0.0
+        composite_demand = total_hoop_demand
 
     if composite_demand > 0:
         t_required = composite_demand / (ec * ISO_STRAIN_LIMIT)
@@ -81,42 +79,27 @@ def calc_iso24817(pressure_mpa, od, wall, rem_wall, yield_strength, ec, defect_t
     return t_required, ISO_STRAIN_LIMIT, composite_demand, steel_contribution
 
 
-def calc_asme_pcc2(pressure_mpa, od, wall, rem_wall, yield_strength, ec, design_factor, temp,
-                   defect_type, defect_loc, wall_loss_ratio):
+def calc_asme_pcc2(pressure_mpa, od, wall, rem_wall, yield_strength, ec,
+                   design_factor, temp, repair_class):
     """
     ASME PCC-2 repair thickness calculation.
-    Derives the design strain from measured failure strain divided by a safety factor.
-    
-    Formula: t_repair = (P_composite × D) / (2 × Ec × ε_design)
-    
-    Where ε_design = ε_fail × temp_factor / (1/design_factor)
+    Derives the design strain from measured failure strain divided by safety factor.
+
+    repair_class: "Type A" or "Type B" - selected by the engineer directly.
+
+    Type A: Composite covers the pressure deficit above what remaining steel can hold.
+    Type B: Composite covers the full design pressure alone.
     """
     safety_factor = 1.0 / design_factor
     temp_factor = 0.95 if temp > 40 else 1.0
     design_strain = (PROWRAP["strain_fail"] * temp_factor) / safety_factor
 
-    is_through_wall = defect_type in ["Leak", "Crack"]
-    is_severe = wall_loss_ratio > 0.65
-
-    # Allowable steel stress (derated by design factor)
-    allowable_steel_stress = yield_strength * design_factor
-
-    if is_through_wall or defect_loc == "Internal" or is_severe:
-        p_steel_capacity = 0.0
-    else:
+    if repair_class == "Type A":
+        allowable_steel_stress = yield_strength * design_factor
         p_steel_capacity = (2 * allowable_steel_stress * rem_wall) / od
-
-    # Type A vs Type B logic
-    if defect_type == "Corrosion" and defect_loc == "External" and not is_severe:
-        calc_method = "Type A (Load Sharing)"
-    elif defect_type == "Dent":
-        calc_method = "Type A (Dent Reinforcement)"
-    else:
-        calc_method = "Type B (Total Replacement)"
-
-    if "Type A" in calc_method and p_steel_capacity > 0:
         p_composite_design = max(0, pressure_mpa - p_steel_capacity)
-    else:
+    else:  # Type B
+        p_steel_capacity = 0.0
         p_composite_design = pressure_mpa
 
     if p_composite_design > 0:
@@ -124,14 +107,21 @@ def calc_asme_pcc2(pressure_mpa, od, wall, rem_wall, yield_strength, ec, design_
     else:
         t_required = 0.0
 
-    return t_required, design_strain, p_composite_design, p_steel_capacity, calc_method
+    return t_required, design_strain, p_composite_design, p_steel_capacity
 
 
-def calc_overlap(num_plies, final_thickness, design_strain, safety_factor, calc_method_overlap):
-    """Calculate axial overlap length based on repair type."""
-    if "Type A" in calc_method_overlap:
+def calc_overlap(final_thickness, design_strain, safety_factor, repair_class):
+    """
+    Calculate axial overlap length based on repair class.
+
+    Type A (Geometry Controlled): loverlap = max(50mm, 3 x t_repair)
+    Type B (Shear Controlled):   loverlap = (t x Ec x ect) / (tau / SF)
+
+    Overlap method is ALWAYS coupled to repair class - never decoupled.
+    """
+    if repair_class == "Type A":
         overlap = max(50.0, 3.0 * final_thickness)
-    else:
+    else:  # Type B
         hoop_load = final_thickness * PROWRAP["modulus_circ"] * design_strain
         allowable_shear = PROWRAP["lap_shear"] / safety_factor
         overlap = max(hoop_load / allowable_shear, 50.0)
@@ -154,12 +144,15 @@ def calc_procurement(total_repair_length, od, num_plies):
     return num_bands, proc_length, sqm, epoxy
 
 
+# ======================================================================
+# PDF GENERATOR
+# ======================================================================
+
 def create_pdf(report_data):
     """Generates a PDF report and returns it as bytes."""
     pdf = FPDF()
     pdf.add_page()
 
-    # Title
     pdf.set_font("Arial", 'B', 16)
     pdf.cell(0, 10, txt="PROWRAP COMPOSITE REPAIR REPORT", ln=True, align='C')
     pdf.set_font("Arial", 'I', 10)
@@ -187,62 +180,71 @@ def create_pdf(report_data):
         "Operating Temperature": f"{report_data['temp']} C"
     })
 
+    rc = report_data['repair_class']
+    rc_desc = "Load Sharing (steel + composite)" if rc == "Type A" else "Full Replacement (composite carries all)"
+
     add_section("2. Defect Assessment", {
         "Defect Mechanism": report_data['defect_type'],
         "Defect Location": report_data['defect_loc'],
         "Remaining Wall": f"{report_data['rem_wall']} mm",
         "Axial Length": f"{report_data['length']} mm",
         "Wall Loss": f"{report_data['wall_loss_ratio']*100:.1f} %",
+        "Repair Class (ISO 24817)": f"{rc} - {rc_desc}",
     })
 
-    # --- Primary Result ---
+    # Primary result
     std = report_data['selected_standard']
-    r = report_data['results'][std] if std != "Both" else report_data['results']['ISO 24817']
+    r = report_data['results']['ISO 24817'] if std in ["ISO 24817", "Both"] else report_data['results']['ASME PCC-2']
 
     add_section(f"3. Repair Design ({std if std != 'Both' else 'ISO 24817 - Governing'})", {
         "Calculation Standard": std if std != "Both" else "ISO 24817 (Governing)",
+        "Repair Class": rc,
         "Design Strain (ect)": f"{r['design_strain']*100:.3f} % ({r['strain_note']})",
+        "Steel Contribution": f"{r['steel_contribution']:.1f} N/mm" if rc == "Type A" else "None (Type B)",
         "Required Plies": f"{r['num_plies']} Layers",
         "Repair Thickness": f"{r['final_thickness']:.2f} mm",
-        "Min. Required Repair Length": f"{r['iso_length']:.0f} mm",
+        "Overlap Method": "Geometry Controlled (3 x t)" if rc == "Type A" else "Shear Controlled",
+        "Overlap Length (each side)": f"{r['overlap']:.1f} mm",
+        "Total Repair Length": f"{r['iso_length']:.0f} mm",
         "Procurement Length": f"{r['proc_length']} mm ({r['num_bands']} Bands)",
     })
 
-    # If both standards, add comparison
+    # If both standards, add ASME comparison
     if std == "Both":
         r_asme = report_data['results']['ASME PCC-2']
         add_section("3b. Comparison: ASME PCC-2 Result", {
             "Calculation Standard": "ASME PCC-2",
+            "Repair Class": rc,
             "Design Strain": f"{r_asme['design_strain']*100:.3f} %",
             "Required Plies": f"{r_asme['num_plies']} Layers",
             "Repair Thickness": f"{r_asme['final_thickness']:.2f} mm",
-            "Min. Required Repair Length": f"{r_asme['iso_length']:.0f} mm",
+            "Total Repair Length": f"{r_asme['iso_length']:.0f} mm",
             "Procurement Length": f"{r_asme['proc_length']} mm ({r_asme['num_bands']} Bands)",
         })
 
-        # Comparison note
         pdf.set_font("Arial", 'B', 10)
         pdf.set_text_color(180, 0, 0)
-        diff_plies = r['num_plies'] - r_asme['num_plies']
-        if diff_plies > 0:
+        diff = r['num_plies'] - r_asme['num_plies']
+        if diff > 0:
             pdf.multi_cell(0, 6, txt=safe_text(
-                f"IMPORTANT: ISO 24817 requires {diff_plies} additional layer(s) vs ASME PCC-2 "
-                f"due to the fixed strain limit (ect=0.008). ISO 24817 is the more conservative standard."
+                f"IMPORTANT: ISO 24817 requires {diff} additional layer(s) vs ASME PCC-2 "
+                f"due to fixed strain limit (ect=0.008). ISO 24817 is the more conservative standard."
             ))
         pdf.set_text_color(0, 0, 0)
         pdf.ln(3)
 
-    # Note about design life
+    # Design notes
     pdf.set_font("Arial", 'I', 9)
     pdf.set_text_color(100, 100, 100)
     pdf.multi_cell(0, 5, txt=safe_text(
-        f"* Note: Design life = {report_data['design_life']} years. "
+        f"* Repair Class {rc} selected by engineer. "
+        f"Design life = {report_data['design_life']} years. "
         f"Design factor f = {report_data['design_factor']}."
     ))
     pdf.set_text_color(0, 0, 0)
     pdf.ln(5)
 
-    # Material procurement (use governing result)
+    # Material procurement
     add_section("4. Material Procurement", {
         "Fabric Needed (300mm Roll)": f"{r['sqm']:.2f} sqm",
         "Epoxy Required": f"{r['epoxy_kg']:.1f} kg"
@@ -259,7 +261,8 @@ def create_pdf(report_data):
         "2. Primer/Filler: Apply Prowrap Filler to defect area to restore OD.",
         f"3. Lamination: Saturate Carbon Cloth. Apply {r['num_plies']} layers per band.",
         f"4. Wrapping: Use {r['num_bands']} band(s) of 300mm cloth.",
-        f"5. Quality Control: Minimum average Shore D hardness of {PROWRAP['shore_d']} required."
+        f"5. Overlap: Ensure {r['overlap']:.0f} mm min. extension beyond defect each side.",
+        f"6. Quality Control: Minimum average Shore D hardness of {PROWRAP['shore_d']} required."
     ]
     for step in steps:
         pdf.multi_cell(0, 6, txt=safe_text(step))
@@ -277,15 +280,21 @@ def create_pdf(report_data):
     return bytes(output)
 
 
+# ======================================================================
+# MAIN CALCULATION RUNNER
+# ======================================================================
+
 def run_calculation(customer, location, report_no, od, wall, pressure, temp,
                     defect_type, defect_loc, length, rem_wall, yield_strength,
-                    design_factor, design_life, selected_standard):
+                    design_factor, design_life, selected_standard, repair_class):
     # --- Input Validation ---
     errors = []
     if temp > PROWRAP["max_temp"]:
         errors.append(f"❌ **CRITICAL:** Operating temperature ({temp}°C) exceeds Prowrap limit of {PROWRAP['max_temp']}°C.")
     if rem_wall > wall:
         errors.append("❌ **INPUT ERROR:** Remaining wall cannot exceed nominal wall thickness.")
+    if rem_wall <= 0 and repair_class == "Type A":
+        errors.append("❌ **INPUT ERROR:** Type A requires remaining wall > 0. Use Type B for through-wall defects.")
     if errors:
         for err in errors:
             st.error(err)
@@ -297,15 +306,14 @@ def run_calculation(customer, location, report_no, od, wall, pressure, temp,
     safety_factor = 1.0 / design_factor
 
     # ====================================================================
-    # DUAL CALCULATION ENGINE
+    # DUAL CALCULATION ENGINE - repair_class is engineer's direct choice
     # ====================================================================
     results = {}
 
-    # --- ISO 24817 Path (εct = 0.008 fixed) ---
+    # --- ISO 24817 Path (ect = 0.008 fixed) ---
     if selected_standard in ["ISO 24817", "Both"]:
         t_iso, strain_iso, composite_demand_iso, steel_contrib_iso = calc_iso24817(
-            pressure_mpa, od, wall, rem_wall, yield_strength, ec,
-            defect_type, defect_loc, wall_loss_ratio
+            pressure_mpa, od, wall, rem_wall, yield_strength, ec, repair_class
         )
         n_iso = math.ceil(t_iso / PROWRAP["ply_thickness"])
         min_plies = 4 if defect_type == "Leak" else 2
@@ -316,15 +324,8 @@ def run_calculation(customer, location, report_no, od, wall, pressure, temp,
 
         ft_iso = n_iso * PROWRAP["ply_thickness"]
 
-        # Overlap: ISO uses shear-controlled for through-wall, geometry otherwise
-        if defect_type in ["Leak", "Crack"] or wall_loss_ratio > 0.80:
-            overlap_method = "Type B (Shear Controlled)"
-        elif defect_type == "Corrosion" and defect_loc == "External":
-            overlap_method = "Type A (Geometry Controlled)"
-        else:
-            overlap_method = "Type B (Shear Controlled)"
-
-        ov_iso = calc_overlap(n_iso, ft_iso, strain_iso, safety_factor, overlap_method)
+        # Overlap is ALWAYS coupled to repair class
+        ov_iso = calc_overlap(ft_iso, strain_iso, safety_factor, repair_class)
         total_len_iso = length + 2 * ov_iso
         nb_iso, pl_iso, sqm_iso, ep_iso = calc_procurement(total_len_iso, od, n_iso)
 
@@ -333,18 +334,19 @@ def run_calculation(customer, location, report_no, od, wall, pressure, temp,
             "strain_note": "Fixed per ISO 24817 (ect=0.008)",
             "composite_pressure": composite_demand_iso / (od / 2) if od > 0 else 0,
             "steel_capacity_mpa": (2 * steel_contrib_iso) / od if od > 0 else 0,
+            "steel_contribution": steel_contrib_iso,
             "num_plies": n_iso, "final_thickness": ft_iso,
             "overlap": ov_iso, "iso_length": total_len_iso,
             "num_bands": nb_iso, "proc_length": pl_iso,
             "sqm": sqm_iso, "epoxy_kg": ep_iso,
-            "calc_method": overlap_method,
+            "repair_class": repair_class,
         }
 
     # --- ASME PCC-2 Path (strain from measured failure / safety factor) ---
     if selected_standard in ["ASME PCC-2", "Both"]:
-        t_asme, strain_asme, p_comp_asme, p_steel_asme, method_asme = calc_asme_pcc2(
+        t_asme, strain_asme, p_comp_asme, p_steel_asme = calc_asme_pcc2(
             pressure_mpa, od, wall, rem_wall, yield_strength, ec,
-            design_factor, temp, defect_type, defect_loc, wall_loss_ratio
+            design_factor, temp, repair_class
         )
         n_asme = math.ceil(t_asme / PROWRAP["ply_thickness"])
         min_plies = 4 if defect_type == "Leak" else 2
@@ -355,12 +357,8 @@ def run_calculation(customer, location, report_no, od, wall, pressure, temp,
 
         ft_asme = n_asme * PROWRAP["ply_thickness"]
 
-        if "Type A" in method_asme:
-            overlap_method_asme = "Type A (Geometry Controlled)"
-        else:
-            overlap_method_asme = "Type B (Shear Controlled)"
-
-        ov_asme = calc_overlap(n_asme, ft_asme, strain_asme, safety_factor, overlap_method_asme)
+        # Overlap coupled to repair class
+        ov_asme = calc_overlap(ft_asme, strain_asme, safety_factor, repair_class)
         total_len_asme = length + 2 * ov_asme
         nb_asme, pl_asme, sqm_asme, ep_asme = calc_procurement(total_len_asme, od, n_asme)
 
@@ -369,11 +367,12 @@ def run_calculation(customer, location, report_no, od, wall, pressure, temp,
             "strain_note": f"Derived: {PROWRAP['strain_fail']*100:.2f}% / SF",
             "composite_pressure": p_comp_asme,
             "steel_capacity_mpa": p_steel_asme,
+            "steel_contribution": p_steel_asme * od / 2,
             "num_plies": n_asme, "final_thickness": ft_asme,
             "overlap": ov_asme, "iso_length": total_len_asme,
             "num_bands": nb_asme, "proc_length": pl_asme,
             "sqm": sqm_asme, "epoxy_kg": ep_asme,
-            "calc_method": method_asme,
+            "repair_class": repair_class,
         }
 
     # ====================================================================
@@ -381,12 +380,24 @@ def run_calculation(customer, location, report_no, od, wall, pressure, temp,
     # ====================================================================
     st.success("✅ Calculation Complete")
 
-    # Determine the governing (most conservative) result for display
+    # Show repair class prominently
+    if repair_class == "Type A":
+        st.info(
+            f"🔵 **Repair Class: Type A (Load Sharing)** — "
+            f"Steel remaining wall ({rem_wall} mm) is credited. "
+            f"Composite shares the hoop load. Overlap is geometry-controlled."
+        )
+    else:
+        st.error(
+            f"🔴 **Repair Class: Type B (Full Replacement)** — "
+            f"No steel credit. Composite carries 100% of hoop stress. "
+            f"Overlap is shear-controlled (longer)."
+        )
+
+    # Determine governing result
     if selected_standard == "Both":
         gov_key = max(results, key=lambda k: results[k]['num_plies'])
         gov = results[gov_key]
-        non_gov_key = [k for k in results if k != gov_key][0]
-        non_gov = results[non_gov_key]
     else:
         gov_key = selected_standard
         gov = results[gov_key]
@@ -395,8 +406,8 @@ def run_calculation(customer, location, report_no, od, wall, pressure, temp,
     m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric("Required Plies", f"{gov['num_plies']}", f"{gov['final_thickness']:.2f} mm")
     m2.metric("Design Strain (εct)", f"{gov['design_strain']*100:.3f} %")
-    m3.metric("Req. Repair Length", f"{gov['iso_length']:.0f} mm")
-    m4.metric("Optimized Fabric", f"{gov['sqm']:.2f} m²")
+    m3.metric("Overlap (each side)", f"{gov['overlap']:.1f} mm")
+    m4.metric("Total Repair Length", f"{gov['iso_length']:.0f} mm")
     m5.metric("Epoxy Needed", f"{gov['epoxy_kg']:.1f} kg")
 
     if selected_standard == "Both":
@@ -415,9 +426,15 @@ def run_calculation(customer, location, report_no, od, wall, pressure, temp,
             badge = " 🏛️ GOVERNING" if is_gov_iso else ""
             st.markdown(f"#### ISO 24817{badge}")
             r_iso = results["ISO 24817"]
+            st.write(f"**Repair Class:** {repair_class}")
             st.write(f"**Design Strain (εct):** {r_iso['design_strain']*100:.3f}% — *Fixed (code-mandated)*")
+            if repair_class == "Type A":
+                st.write(f"**Steel Contribution:** {r_iso['steel_contribution']:.1f} N/mm")
+            else:
+                st.write("**Steel Contribution:** None (Type B)")
             st.write(f"**Theoretical Thickness:** {r_iso['t_required']:.2f} mm")
             st.write(f"**Required Plies:** {r_iso['num_plies']} layers → {r_iso['final_thickness']:.2f} mm")
+            st.write(f"**Overlap:** {r_iso['overlap']:.1f} mm ({'Geometry' if repair_class == 'Type A' else 'Shear'} controlled)")
             st.write(f"**Repair Length:** {r_iso['iso_length']:.0f} mm")
             st.write(f"**Fabric:** {r_iso['sqm']:.2f} m² | **Epoxy:** {r_iso['epoxy_kg']:.1f} kg")
 
@@ -430,9 +447,15 @@ def run_calculation(customer, location, report_no, od, wall, pressure, temp,
             badge = " 🏛️ GOVERNING" if is_gov_asme else ""
             st.markdown(f"#### ASME PCC-2{badge}")
             r_asme = results["ASME PCC-2"]
+            st.write(f"**Repair Class:** {repair_class}")
             st.write(f"**Design Strain:** {r_asme['design_strain']*100:.3f}% — *Derived from test data*")
+            if repair_class == "Type A":
+                st.write(f"**Steel Contribution:** {r_asme['steel_contribution']:.1f} N/mm")
+            else:
+                st.write("**Steel Contribution:** None (Type B)")
             st.write(f"**Theoretical Thickness:** {r_asme['t_required']:.2f} mm")
             st.write(f"**Required Plies:** {r_asme['num_plies']} layers → {r_asme['final_thickness']:.2f} mm")
+            st.write(f"**Overlap:** {r_asme['overlap']:.1f} mm ({'Geometry' if repair_class == 'Type A' else 'Shear'} controlled)")
             st.write(f"**Repair Length:** {r_asme['iso_length']:.0f} mm")
             st.write(f"**Fabric:** {r_asme['sqm']:.2f} m² | **Epoxy:** {r_asme['epoxy_kg']:.1f} kg")
 
@@ -440,11 +463,9 @@ def run_calculation(customer, location, report_no, od, wall, pressure, temp,
         diff = results["ISO 24817"]["num_plies"] - results["ASME PCC-2"]["num_plies"]
         if diff > 0:
             st.warning(
-                f"⚠️ **ISO 24817 requires {diff} more layer(s)** than ASME PCC-2 for the same defect. "
-                f"This is because ISO uses a fixed εct = 0.008 (0.8%), while ASME derives "
-                f"ε = {results['ASME PCC-2']['design_strain']*100:.3f}% from tested failure strain. "
-                f"The ISO approach is ~{results['ISO 24817']['num_plies']/results['ASME PCC-2']['num_plies']:.1f}× "
-                f"more conservative on layer count."
+                f"⚠️ **ISO 24817 requires {diff} more layer(s)** than ASME PCC-2 ({repair_class}). "
+                f"ISO uses fixed εct = 0.008, ASME derives "
+                f"ε = {results['ASME PCC-2']['design_strain']*100:.3f}% from test data."
             )
         elif diff < 0:
             st.info("ℹ️ ASME PCC-2 is more conservative in this case (unusual — check inputs).")
@@ -472,23 +493,33 @@ def run_calculation(customer, location, report_no, od, wall, pressure, temp,
     tab1, tab2 = st.tabs(["📊 Engineering Analysis", "📄 Method Statement"])
 
     with tab1:
-        c1, c2 = st.columns(2)
+        c1, c2, c3 = st.columns(3)
         with c1:
-            st.markdown("### Defect Analysis")
+            st.markdown("### Defect Info")
             st.write(f"**Mechanism:** {defect_type} ({defect_loc})")
             st.write(f"**Wall Loss:** {wall_loss_ratio*100:.1f}%")
             st.write(f"**Remaining Wall:** {rem_wall} mm of {wall} mm")
         with c2:
+            st.markdown("### Repair Class")
+            st.write(f"**Selected:** {repair_class}")
+            if repair_class == "Type A":
+                st.write("Steel remaining wall **is credited**")
+                st.write(f"Sa x ts = {yield_strength} x {rem_wall} = **{yield_strength * rem_wall:.1f} N/mm**")
+                st.write("Overlap: **Geometry controlled** (3 x t)")
+            else:
+                st.write("Steel remaining wall **NOT credited**")
+                st.write("Composite carries **100%** of hoop stress")
+                st.write("Overlap: **Shear controlled** (load transfer)")
+        with c3:
             st.markdown("### Strain Philosophy")
             if selected_standard in ["ISO 24817", "Both"]:
-                st.write(f"**ISO 24817 εct:** {ISO_STRAIN_LIMIT*100:.1f}% — Fixed, code-mandated")
+                st.write(f"**ISO 24817 εct:** {ISO_STRAIN_LIMIT*100:.1f}% — Fixed")
             if selected_standard in ["ASME PCC-2", "Both"]:
                 asme_strain = results.get("ASME PCC-2", {}).get("design_strain", 0)
-                st.write(f"**ASME PCC-2 ε:** {asme_strain*100:.3f}% — Derived from {PROWRAP['strain_fail']*100:.2f}% failure / SF={safety_factor:.2f}")
+                st.write(f"**ASME PCC-2 ε:** {asme_strain*100:.3f}% — Derived (failure/SF)")
             if selected_standard == "Both":
                 ratio = asme_strain / ISO_STRAIN_LIMIT if ISO_STRAIN_LIMIT > 0 else 0
-                st.write(f"**Ratio:** ASME strain is {ratio:.1f}× the ISO limit")
-                st.caption("ISO's conservative fixed strain ensures a consistent safety margin regardless of supplier test data.")
+                st.write(f"**Ratio:** ASME strain is {ratio:.1f}x the ISO limit")
 
     with tab2:
         st.markdown("## 🛠️ Prowrap Repair Method Statement")
@@ -511,28 +542,32 @@ def run_calculation(customer, location, report_no, od, wall, pressure, temp,
             - **Remaining Wall:** {rem_wall} mm
             - **Axial Length:** {length} mm
             - **Wall Loss:** {wall_loss_ratio*100:.1f}%
+            - **Repair Class:** {repair_class}
             """)
         with c_repair:
             st.success(f"**3. Repair Design ({gov_key})**")
             st.markdown(f"""
+            - **Repair Class:** {repair_class}
             - **Total Plies:** {gov['num_plies']} Layers
             - **Repair Thickness:** {gov['final_thickness']:.2f} mm
             - **Design Strain:** {gov['design_strain']*100:.3f}%
-            - **Req. Length (calc):** {gov['iso_length']:.0f} mm
-            - **Axial Band(s):** {gov['num_bands']} × 300mm
+            - **Overlap:** {gov['overlap']:.1f} mm ({'Geom.' if repair_class == 'Type A' else 'Shear'})
+            - **Total Repair Length:** {gov['iso_length']:.0f} mm
+            - **Axial Band(s):** {gov['num_bands']} x 300mm
             - **Procurement Len:** {gov['proc_length']} mm
             - **Epoxy Total:** {gov['epoxy_kg']:.1f} kg
             """)
-            st.caption(f"*Calculated per {gov_key}. Design life: {design_life} years, f = {design_factor}.*")
+            st.caption(f"*{gov_key}, {repair_class}. Design life: {design_life} yrs, f = {design_factor}.*")
 
         st.markdown("---")
         st.markdown("### 📋 Installation Checklist")
         st.markdown(f"""
-        1. **Surface Prep:** Grit blast to **SA 2.5**; Profile **>60µm**.
+        1. **Surface Prep:** Grit blast to **SA 2.5**; Profile **>60um**.
         2. **Primer/Filler:** Apply Prowrap Filler to defect area to restore OD profile.
         3. **Lamination:** Saturate Carbon Cloth. Apply **{gov['num_plies']} layers** per band.
         4. **Wrapping:** Use **{gov['num_bands']} band(s)** of 300mm cloth.
-        5. **Quality Control:** Minimum average Shore D hardness of **{PROWRAP['shore_d']}** required.
+        5. **Overlap:** Ensure **{gov['overlap']:.0f} mm** min. extension beyond defect each side.
+        6. **Quality Control:** Minimum average Shore D hardness of **{PROWRAP['shore_d']}** required.
         """)
 
     # --- PDF Generator ---
@@ -546,8 +581,8 @@ def run_calculation(customer, location, report_no, od, wall, pressure, temp,
             "rem_wall": rem_wall, "length": length,
             "wall_loss_ratio": wall_loss_ratio,
             "design_factor": design_factor, "design_life": design_life,
-            "selected_standard": selected_standard,
-            "standard_label": f"{selected_standard} | ISO 24817 / ASME PCC-2" if selected_standard == "Both" else selected_standard,
+            "selected_standard": selected_standard, "repair_class": repair_class,
+            "standard_label": f"{selected_standard} | {repair_class}" if selected_standard != "Both" else f"ISO 24817 / ASME PCC-2 | {repair_class}",
             "results": results,
         }
         pdf_bytes = create_pdf(report_data)
@@ -561,6 +596,10 @@ def run_calculation(customer, location, report_no, od, wall, pressure, temp,
     except Exception as pdf_error:
         st.error(f"⚠️ Could not generate PDF. Error: {pdf_error}")
 
+
+# ======================================================================
+# APP ENTRY POINT
+# ======================================================================
 
 def reset_calc():
     st.session_state.calc_active = False
@@ -598,15 +637,31 @@ def main():
         rem_ = st.sidebar.number_input("Remaining Wall [mm]", value=4.5, on_change=reset_calc)
 
         st.sidebar.header("5. Design Settings")
+
+        # --- REPAIR CLASS SELECTOR ---
+        repair_class = st.sidebar.selectbox(
+            "Repair Class (ISO 24817 Sec. 7.2)",
+            ["Type A", "Type B"],
+            index=1,  # Default to Type B (conservative)
+            help=(
+                "Type A: Steel remaining wall is credited (load sharing). "
+                "Use when remaining wall is reliable and defect will not grow through-wall. "
+                "Type B: No steel credit - composite carries full pressure. "
+                "Use for through-wall risk, uncertain inspection, or growing defects. "
+                "This is the engineer's decision - overrides automatic classification."
+            ),
+            on_change=reset_calc
+        )
+
         selected_standard = st.sidebar.selectbox(
             "Calculation Standard",
             ["Both", "ISO 24817", "ASME PCC-2"],
-            help="ISO 24817 uses fixed εct=0.008. ASME PCC-2 derives strain from test data. 'Both' shows a side-by-side comparison.",
+            help="ISO 24817 uses fixed ect=0.008. ASME PCC-2 derives strain from test data. 'Both' shows comparison.",
             on_change=reset_calc
         )
         design_life = st.sidebar.number_input("Design Life [years]", value=20, min_value=1, on_change=reset_calc)
         df = st.sidebar.number_input("Design Factor (f)", value=0.72, min_value=0.1, max_value=1.0, on_change=reset_calc,
-                                     help="Used by ASME PCC-2 path. ISO 24817 path uses fixed εct=0.008 regardless of this factor.")
+                                     help="Used by ASME PCC-2 path. ISO 24817 uses fixed ect=0.008 regardless.")
 
         if st.sidebar.button("Calculate & Optimize", type="primary"):
             st.session_state.calc_active = True
@@ -614,7 +669,8 @@ def main():
 
         if st.session_state.calc_active:
             run_calculation(customer, location, report_no, od, wall, pres, temp,
-                            type_, loc_, len_, rem_, yield_str, df, design_life, selected_standard)
+                            type_, loc_, len_, rem_, yield_str, df, design_life,
+                            selected_standard, repair_class)
 
     except Exception as e:
         st.error(f"⚠️ Application Error: {e}")
